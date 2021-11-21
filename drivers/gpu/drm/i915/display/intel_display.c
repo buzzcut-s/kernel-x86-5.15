@@ -1153,7 +1153,7 @@ static unsigned int intel_linear_alignment(const struct drm_i915_private *dev_pr
 
 static bool has_async_flips(struct drm_i915_private *i915)
 {
-	return DISPLAY_VER(i915) >= 5;
+	return false;
 }
 
 unsigned int intel_surf_alignment(const struct drm_framebuffer *fb,
