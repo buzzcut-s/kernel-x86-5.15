@@ -1796,6 +1796,7 @@ static struct ctl_table kern_table[] = {
 #endif /* CONFIG_SMP */
 #endif /* CONFIG_SCHED_DEBUG */
 #else  /* !CONFIG_SCHED_ALT */
+<<<<<<< HEAD
 	{
 		.procname	= "hrtimer_granularity_us",
 		.data		= &hrtimer_granularity_us,
@@ -1814,6 +1815,8 @@ static struct ctl_table kern_table[] = {
 		.extra1		= SYSCTL_ONE,
 		.extra2		= &ten_thousand,
 	},
+=======
+>>>>>>> prjc
 	{
 		.procname	= "sched_child_runs_first",
 		.data		= &sysctl_sched_child_runs_first,
