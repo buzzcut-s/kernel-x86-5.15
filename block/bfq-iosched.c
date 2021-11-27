@@ -960,16 +960,6 @@ reset_entity_pointer:
 	bfq_put_queue(bfqq);
 }
 
-static inline void
-bfq_clear_group_with_pending_reqs(struct bfq_data *bfqd,
-				  struct bfq_entity *entity)
-{
-	if (entity->in_groups_with_pending_reqs) {
-		entity->in_groups_with_pending_reqs = false;
-		bfqd->num_groups_with_pending_reqs--;
-	}
-}
-
 /*
  * Invoke __bfq_weights_tree_remove on bfqq and decrement the number
  * of active groups for each queue's inactive parent entity.
@@ -978,25 +968,9 @@ void bfq_weights_tree_remove(struct bfq_data *bfqd,
 			     struct bfq_queue *bfqq)
 {
 	struct bfq_entity *entity = bfqq->entity.parent;
-	struct bfq_sched_data *sd;
-
-	/*
-	 * If the bfq queue is in root group, the decrement of
-	 * num_groups_with_pending_reqs is performed immediately upon the
-	 * deactivation of entity.
-	 */
-	if (!entity) {
-		entity = &bfqd->root_group->entity;
-		sd = entity->my_sched_data;
-
-		if (!sd->in_service_entity)
-			bfq_clear_group_with_pending_reqs(bfqd, entity);
-
-		return;
-	}
 
 	for_each_entity(entity) {
-		sd = entity->my_sched_data;
+		struct bfq_sched_data *sd = entity->my_sched_data;
 
 		if (sd->next_in_service || sd->in_service_entity) {
 			/*
@@ -1014,8 +988,7 @@ void bfq_weights_tree_remove(struct bfq_data *bfqd,
 		}
 
 		/*
-		 * If the bfq queue is not in root group,
-		 * the decrement of num_groups_with_pending_reqs is
+		 * The decrement of num_groups_with_pending_reqs is
 		 * not performed immediately upon the deactivation of
 		 * entity, but it is delayed to when it also happens
 		 * that the first leaf descendant bfqq of entity gets
@@ -1024,7 +997,10 @@ void bfq_weights_tree_remove(struct bfq_data *bfqd,
 		 * needed. See the comments on
 		 * num_groups_with_pending_reqs for details.
 		 */
-		bfq_clear_group_with_pending_reqs(bfqd, entity);
+		if (entity->in_groups_with_pending_reqs) {
+			entity->in_groups_with_pending_reqs = false;
+			bfqd->num_groups_with_pending_reqs--;
+		}
 	}
 
 	/*
