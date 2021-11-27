@@ -980,7 +980,8 @@ static void bfq_update_groups_with_pending_reqs(struct bfq_entity *entity)
 				&bfqq->bfqd->root_group->entity);
 	} else {
 		/* If the entity represents bfq_group. */
-		struct bfq_group *bfqg = bfq_entity_to_bfqg(entity);
+		struct bfq_group *bfqg =
+			container_of(entity, struct bfq_group, entity);
 		struct bfq_data *bfqd = bfqg->bfqd;
 
 		bfq_set_group_with_pending_reqs(bfqd, entity);
