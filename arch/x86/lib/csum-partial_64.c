@@ -41,6 +41,7 @@ __wsum csum_partial(const void *buff, int len, __wsum sum)
 	if (unlikely(odd)) {
 		if (unlikely(len == 0))
 			return sum;
+		temp64 = ror32((__force u32)sum, 8);
 		temp64 += (*(unsigned char *)buff << 8);
 		len--;
 		buff++;
@@ -92,6 +93,7 @@ __wsum csum_partial(const void *buff, int len, __wsum sum)
 		buff += 8;
 	}
 	if (len & 7) {
+#ifdef CONFIG_DCACHE_WORD_ACCESS
 		unsigned int shift = (8 - (len & 7)) * 8;
 		unsigned long trail;
 
@@ -101,6 +103,31 @@ __wsum csum_partial(const void *buff, int len, __wsum sum)
 		    "adcq $0,%[res]"
 			: [res] "+r" (temp64)
 			: [trail] "r" (trail));
+#else
+		if (len & 4) {
+			asm("addq %[val],%[res]\n\t"
+			    "adcq $0,%[res]"
+				: [res] "+r" (temp64)
+				: [val] "r" ((u64)*(u32 *)buff)
+				: "memory");
+			buff += 4;
+		}
+		if (len & 2) {
+			asm("addq %[val],%[res]\n\t"
+			    "adcq $0,%[res]"
+				: [res] "+r" (temp64)
+				: [val] "r" ((u64)*(u16 *)buff)
+				: "memory");
+			buff += 2;
+		}
+		if (len & 1) {
+			asm("addq %[val],%[res]\n\t"
+			    "adcq $0,%[res]"
+				: [res] "+r" (temp64)
+				: [val] "r" ((u64)*(u8 *)buff)
+				: "memory");
+		}
+#endif
 	}
 	result = add32_with_carry(temp64 >> 32, temp64 & 0xffffffff);
 	if (unlikely(odd)) { 
