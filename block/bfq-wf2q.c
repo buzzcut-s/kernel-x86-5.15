@@ -840,7 +840,7 @@ void bfq_bfqq_served(struct bfq_queue *bfqq, int served)
 		bfqq->service_from_wr += served;
 
 	bfqq->service_from_backlogged += served;
-	for_each_entity(entity) {
+	for_each_entity_not_root(entity) {
 		st = bfq_entity_service_tree(entity);
 
 		entity->service += served;
@@ -955,46 +955,13 @@ static void bfq_update_fin_time_enqueue(struct bfq_entity *entity,
 
 	bfq_active_insert(st, entity);
 }
-#ifdef CONFIG_BFQ_GROUP_IOSCHED
-static inline void
-bfq_set_group_with_pending_reqs(struct bfq_data *bfqd,
-				struct bfq_entity *entity)
-{
-	if (!entity->in_groups_with_pending_reqs) {
-		entity->in_groups_with_pending_reqs = true;
-		bfqd->num_groups_with_pending_reqs++;
-	}
-}
-
-static void bfq_update_groups_with_pending_reqs(struct bfq_entity *entity)
-{
-	struct bfq_queue *bfqq = bfq_entity_to_bfqq(entity);
-
-	if (bfqq) {
-		/*
-		 * If the entity represents bfq_queue, and the queue belongs to
-		 * root cgroup.
-		 */
-		if (!entity->parent)
-			bfq_set_group_with_pending_reqs(bfqq->bfqd,
-				&bfqq->bfqd->root_group->entity);
-	} else {
-		/* If the entity represents bfq_group. */
-		struct bfq_group *bfqg = bfq_entity_to_bfqg(entity);
-		struct bfq_data *bfqd = bfqg->bfqd;
-
-		bfq_set_group_with_pending_reqs(bfqd, entity);
-	}
-}
-#else
-#define bfq_update_groups_with_pending_reqs(entity) \
-	do {} while (0)
-#endif
 
 /**
  * __bfq_activate_entity - handle activation of entity.
  * @entity: the entity being activated.
  * @non_blocking_wait_rq: true if entity was waiting for a request
+ * @count_group: if entity represents group, true if the group will be
+ * counted in 'num_groups_with_pending_reqs'.
  *
  * Called for a 'true' activation, i.e., if entity is not active and
  * one of its children receives a new request.
@@ -1004,11 +971,19 @@ static void bfq_update_groups_with_pending_reqs(struct bfq_entity *entity)
  * from its idle tree.
  */
 static void __bfq_activate_entity(struct bfq_entity *entity,
-				  bool non_blocking_wait_rq)
+				  bool non_blocking_wait_rq,
+				  bool count_group)
 {
 	struct bfq_service_tree *st = bfq_entity_service_tree(entity);
 	bool backshifted = false;
 	unsigned long long min_vstart;
+
+	if (is_root_entity(entity))
+#ifdef CONFIG_BFQ_GROUP_IOSCHED
+		goto update;
+#else
+		return;
+#endif
 
 	/* See comments on bfq_fqq_update_budg_for_activation */
 	if (non_blocking_wait_rq && bfq_gt(st->vtime, entity->finish)) {
@@ -1044,8 +1019,20 @@ static void __bfq_activate_entity(struct bfq_entity *entity,
 		entity->on_st_or_in_serv = true;
 	}
 
-	bfq_update_groups_with_pending_reqs(entity);
 	bfq_update_fin_time_enqueue(entity, st, backshifted);
+
+#ifdef CONFIG_BFQ_GROUP_IOSCHED
+update:
+	if (count_group && !bfq_entity_to_bfqq(entity)) { /* bfq_group */
+		struct bfq_group *bfqg = bfq_entity_to_bfqg(entity);
+		struct bfq_data *bfqd = bfqg->bfqd;
+
+		if (!entity->in_groups_with_pending_reqs) {
+			entity->in_groups_with_pending_reqs = true;
+			bfqd->num_groups_with_pending_reqs++;
+		}
+	}
+#endif
 }
 
 /**
@@ -1131,11 +1118,13 @@ static void __bfq_requeue_entity(struct bfq_entity *entity)
 
 static void __bfq_activate_requeue_entity(struct bfq_entity *entity,
 					  struct bfq_sched_data *sd,
-					  bool non_blocking_wait_rq)
+					  bool non_blocking_wait_rq,
+					  bool count_group)
 {
 	struct bfq_service_tree *st = bfq_entity_service_tree(entity);
 
-	if (sd->in_service_entity == entity || entity->tree == &st->active)
+	if (sd && (sd->in_service_entity == entity ||
+		   entity->tree == &st->active))
 		 /*
 		  * in service or already queued on the active tree,
 		  * requeue or reposition
@@ -1146,7 +1135,8 @@ static void __bfq_activate_requeue_entity(struct bfq_entity *entity,
 		 * Not in service and not queued on its active tree:
 		 * the activity is idle and this is a true activation.
 		 */
-		__bfq_activate_entity(entity, non_blocking_wait_rq);
+		__bfq_activate_entity(entity, non_blocking_wait_rq,
+				      count_group);
 }
 
 
@@ -1168,12 +1158,14 @@ static void bfq_activate_requeue_entity(struct bfq_entity *entity,
 					bool requeue, bool expiration)
 {
 	struct bfq_sched_data *sd;
+	int depth = 0;
 
 	for_each_entity(entity) {
 		sd = entity->sched_data;
-		__bfq_activate_requeue_entity(entity, sd, non_blocking_wait_rq);
+		__bfq_activate_requeue_entity(entity, sd, non_blocking_wait_rq,
+					      depth++ == 1);
 
-		if (!bfq_update_next_in_service(sd, entity, expiration) &&
+		if (sd && !bfq_update_next_in_service(sd, entity, expiration) &&
 		    !requeue)
 			break;
 	}
@@ -1251,7 +1243,7 @@ static void bfq_deactivate_entity(struct bfq_entity *entity,
 	struct bfq_sched_data *sd;
 	struct bfq_entity *parent = NULL;
 
-	for_each_entity_safe(entity, parent) {
+	for_each_entity_not_root_safe(entity, parent) {
 		sd = entity->sched_data;
 
 		if (!__bfq_deactivate_entity(entity, ins_into_idle_tree)) {
@@ -1320,7 +1312,7 @@ static void bfq_deactivate_entity(struct bfq_entity *entity,
 	 * is not the case.
 	 */
 	entity = parent;
-	for_each_entity(entity) {
+	for_each_entity_not_root(entity) {
 		/*
 		 * Invoke __bfq_requeue_entity on entity, even if
 		 * already active, to requeue/reposition it in the
@@ -1643,7 +1635,7 @@ struct bfq_queue *bfq_get_next_queue(struct bfq_data *bfqd)
 	 * We can finally update all next-to-serve entities along the
 	 * path from the leaf entity just set in service to the root.
 	 */
-	for_each_entity(entity) {
+	for_each_entity_not_root(entity) {
 		struct bfq_sched_data *sd = entity->sched_data;
 
 		if (!bfq_update_next_in_service(sd, NULL, false))
@@ -1670,7 +1662,7 @@ bool __bfq_bfqd_reset_in_service(struct bfq_data *bfqd)
 	 * execute the final step: reset in_service_entity along the
 	 * path from entity to the root.
 	 */
-	for_each_entity(entity)
+	for_each_entity_not_root(entity)
 		entity->sched_data->in_service_entity = NULL;
 
 	/*

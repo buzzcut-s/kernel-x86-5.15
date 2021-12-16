@@ -817,7 +817,7 @@ bfq_pos_tree_add_move(struct bfq_data *bfqd, struct bfq_queue *bfqq)
  * much easier to maintain the needed state:
  * 1) all active queues have the same weight,
  * 2) all active queues belong to the same I/O-priority class,
- * 3) there are one active group at most.
+ * 3) there are one active groups at most.
  * In particular, the last condition is always true if hierarchical
  * support or the cgroups interface are not enabled, thus no state
  * needs to be maintained in this case.
@@ -933,6 +933,16 @@ void bfq_weights_tree_add(struct bfq_data *bfqd, struct bfq_queue *bfqq,
 inc_counter:
 	bfqq->weight_counter->num_active++;
 	bfqq->ref++;
+
+#ifdef CONFIG_BFQ_GROUP_IOSCHED
+	if (!entity->in_groups_with_pending_reqs) {
+		struct bfq_group *bfqg =
+			container_of(entity->parent, struct bfq_group, entity);
+
+		entity->in_groups_with_pending_reqs = true;
+		bfqg->num_entities_with_pending_reqs++;
+	}
+#endif
 }
 
 /*
@@ -949,6 +959,17 @@ void __bfq_weights_tree_remove(struct bfq_data *bfqd,
 		return;
 
 	bfqq->weight_counter->num_active--;
+
+#ifdef CONFIG_BFQ_GROUP_IOSCHED
+	if (bfqq->entity.in_groups_with_pending_reqs) {
+		struct bfq_group *bfqg = container_of(bfqq->entity.parent,
+				struct bfq_group, entity);
+
+		bfqq->entity.in_groups_with_pending_reqs = false;
+		bfqg->num_entities_with_pending_reqs--;
+	}
+#endif
+
 	if (bfqq->weight_counter->num_active > 0)
 		goto reset_entity_pointer;
 
@@ -960,14 +981,24 @@ reset_entity_pointer:
 	bfq_put_queue(bfqq);
 }
 
-static inline void
-bfq_clear_group_with_pending_reqs(struct bfq_data *bfqd,
-				  struct bfq_entity *entity)
+static void decrease_groups_with_pending_reqs(struct bfq_data *bfqd,
+					      struct bfq_queue *bfqq)
 {
-	if (entity->in_groups_with_pending_reqs) {
+#ifdef CONFIG_BFQ_GROUP_IOSCHED
+	struct bfq_entity *entity = bfqq->entity.parent;
+	struct bfq_group *bfqg = container_of(entity, struct bfq_group, entity);
+
+	/*
+	 * The decrement of num_groups_with_pending_reqs is performed
+	 * immediately upon the deactivation of last entity that have pending
+	 * requests
+	 */
+	if (!bfqg->num_entities_with_pending_reqs &&
+	    entity->in_groups_with_pending_reqs) {
 		entity->in_groups_with_pending_reqs = false;
 		bfqd->num_groups_with_pending_reqs--;
 	}
+#endif
 }
 
 /*
@@ -977,64 +1008,11 @@ bfq_clear_group_with_pending_reqs(struct bfq_data *bfqd,
 void bfq_weights_tree_remove(struct bfq_data *bfqd,
 			     struct bfq_queue *bfqq)
 {
-	struct bfq_entity *entity = bfqq->entity.parent;
-	struct bfq_sched_data *sd;
-
-	/*
-	 * If the bfq queue is in root group, the decrement of
-	 * num_groups_with_pending_reqs is performed immediately upon the
-	 * deactivation of entity.
-	 */
-	if (!entity) {
-		entity = &bfqd->root_group->entity;
-		sd = entity->my_sched_data;
-
-		if (!sd->in_service_entity)
-			bfq_clear_group_with_pending_reqs(bfqd, entity);
-
-		return;
-	}
-
-	for_each_entity(entity) {
-		sd = entity->my_sched_data;
-
-		if (sd->next_in_service || sd->in_service_entity) {
-			/*
-			 * entity is still active, because either
-			 * next_in_service or in_service_entity is not
-			 * NULL (see the comments on the definition of
-			 * next_in_service for details on why
-			 * in_service_entity must be checked too).
-			 *
-			 * As a consequence, its parent entities are
-			 * active as well, and thus this loop must
-			 * stop here.
-			 */
-			break;
-		}
-
-		/*
-		 * If the bfq queue is not in root group,
-		 * the decrement of num_groups_with_pending_reqs is
-		 * not performed immediately upon the deactivation of
-		 * entity, but it is delayed to when it also happens
-		 * that the first leaf descendant bfqq of entity gets
-		 * all its pending requests completed. The following
-		 * instructions perform this delayed decrement, if
-		 * needed. See the comments on
-		 * num_groups_with_pending_reqs for details.
-		 */
-		bfq_clear_group_with_pending_reqs(bfqd, entity);
-	}
-
-	/*
-	 * Next function is invoked last, because it causes bfqq to be
-	 * freed if the following holds: bfqq is not in service and
-	 * has no dispatched request. DO NOT use bfqq after the next
-	 * function invocation.
-	 */
+	bfqq->ref++;
 	__bfq_weights_tree_remove(bfqd, bfqq,
 				  &bfqd->queue_weights_tree);
+	decrease_groups_with_pending_reqs(bfqd, bfqq);
+	bfq_put_queue(bfqq);
 }
 
 /*
@@ -4432,7 +4410,7 @@ void bfq_bfqq_expire(struct bfq_data *bfqd,
 	 * service with the same budget.
 	 */
 	entity = entity->parent;
-	for_each_entity(entity)
+	for_each_entity_not_root(entity)
 		entity->service = 0;
 }
 
@@ -5333,6 +5311,7 @@ void bfq_put_queue(struct bfq_queue *bfqq)
 	if (bfqq->bfqd && bfqq->bfqd->last_completed_rq_bfqq == bfqq)
 		bfqq->bfqd->last_completed_rq_bfqq = NULL;
 
+	hlist_del(&bfqq->children_node);
 	kmem_cache_free(bfq_pool, bfqq);
 	bfqg_and_blkg_put(bfqg);
 }
@@ -5507,8 +5486,9 @@ static void bfq_check_ioprio_change(struct bfq_io_cq *bic, struct bio *bio)
 		bfq_set_next_ioprio_data(bfqq, bic);
 }
 
-static void bfq_init_bfqq(struct bfq_data *bfqd, struct bfq_queue *bfqq,
-			  struct bfq_io_cq *bic, pid_t pid, int is_sync)
+static void bfq_init_bfqq(struct bfq_data *bfqd, struct bfq_group *bfqg,
+			  struct bfq_queue *bfqq, struct bfq_io_cq *bic,
+			  pid_t pid, int is_sync)
 {
 	u64 now_ns = ktime_get_ns();
 
@@ -5517,6 +5497,7 @@ static void bfq_init_bfqq(struct bfq_data *bfqd, struct bfq_queue *bfqq,
 	INIT_HLIST_NODE(&bfqq->burst_list_node);
 	INIT_HLIST_NODE(&bfqq->woken_list_node);
 	INIT_HLIST_HEAD(&bfqq->woken_list);
+	hlist_add_head(&bfqq->children_node, &bfqg->children);
 
 	bfqq->ref = 0;
 	bfqq->bfqd = bfqd;
@@ -5770,8 +5751,7 @@ static struct bfq_queue *bfq_get_queue(struct bfq_data *bfqd,
 				     bfqd->queue->node);
 
 	if (bfqq) {
-		bfq_init_bfqq(bfqd, bfqq, bic, current->pid,
-			      is_sync);
+		bfq_init_bfqq(bfqd, bfqg, bfqq, bic, current->pid, is_sync);
 		bfq_init_entity(&bfqq->entity, bfqg);
 		bfq_log_bfqq(bfqd, bfqq, "allocated");
 	} else {
@@ -7034,6 +7014,7 @@ static void bfq_exit_queue(struct elevator_queue *e)
 {
 	struct bfq_data *bfqd = e->elevator_data;
 	struct bfq_queue *bfqq, *n;
+	struct request_queue *q = bfqd->queue;
 
 	hrtimer_cancel(&bfqd->idle_slice_timer);
 
@@ -7044,6 +7025,7 @@ static void bfq_exit_queue(struct elevator_queue *e)
 
 	hrtimer_cancel(&bfqd->idle_slice_timer);
 
+	hlist_del(&bfqd->oom_bfqq.children_node);
 	/* release oom-queue reference to root group */
 	bfqg_and_blkg_put(bfqd->root_group);
 
@@ -7057,6 +7039,9 @@ static void bfq_exit_queue(struct elevator_queue *e)
 #endif
 
 	kfree(bfqd);
+
+	/* Re-enable throttling in case elevator disabled it */
+	wbt_enable_default(q);
 }
 
 static void bfq_init_root_group(struct bfq_group *root_group,
@@ -7096,28 +7081,6 @@ static int bfq_init_queue(struct request_queue *q, struct elevator_type *e)
 	spin_lock_irq(&q->queue_lock);
 	q->elevator = eq;
 	spin_unlock_irq(&q->queue_lock);
-
-	/*
-	 * Our fallback bfqq if bfq_find_alloc_queue() runs into OOM issues.
-	 * Grab a permanent reference to it, so that the normal code flow
-	 * will not attempt to free it.
-	 */
-	bfq_init_bfqq(bfqd, &bfqd->oom_bfqq, NULL, 1, 0);
-	bfqd->oom_bfqq.ref++;
-	bfqd->oom_bfqq.new_ioprio = BFQ_DEFAULT_QUEUE_IOPRIO;
-	bfqd->oom_bfqq.new_ioprio_class = IOPRIO_CLASS_BE;
-	bfqd->oom_bfqq.entity.new_weight =
-		bfq_ioprio_to_weight(bfqd->oom_bfqq.new_ioprio);
-
-	/* oom_bfqq does not participate to bursts */
-	bfq_clear_bfqq_just_created(&bfqd->oom_bfqq);
-
-	/*
-	 * Trigger weight initialization, according to ioprio, at the
-	 * oom_bfqq's first activation. The oom_bfqq's ioprio and ioprio
-	 * class won't be changed any more.
-	 */
-	bfqd->oom_bfqq.entity.prio_changed = 1;
 
 	bfqd->queue = q;
 
@@ -7197,6 +7160,27 @@ static int bfq_init_queue(struct request_queue *q, struct elevator_type *e)
 		goto out_free;
 	bfq_init_root_group(bfqd->root_group, bfqd);
 	bfq_init_entity(&bfqd->oom_bfqq.entity, bfqd->root_group);
+	/*
+	 * Our fallback bfqq if bfq_find_alloc_queue() runs into OOM issues.
+	 * Grab a permanent reference to it, so that the normal code flow
+	 * will not attempt to free it.
+	 */
+	bfq_init_bfqq(bfqd, bfqd->root_group, &bfqd->oom_bfqq, NULL, 1, 0);
+	bfqd->oom_bfqq.ref++;
+	bfqd->oom_bfqq.new_ioprio = BFQ_DEFAULT_QUEUE_IOPRIO;
+	bfqd->oom_bfqq.new_ioprio_class = IOPRIO_CLASS_BE;
+	bfqd->oom_bfqq.entity.new_weight =
+		bfq_ioprio_to_weight(bfqd->oom_bfqq.new_ioprio);
+
+	/* oom_bfqq does not participate to bursts */
+	bfq_clear_bfqq_just_created(&bfqd->oom_bfqq);
+
+	/*
+	 * Trigger weight initialization, according to ioprio, at the
+	 * oom_bfqq's first activation. The oom_bfqq's ioprio and ioprio
+	 * class won't be changed any more.
+	 */
+	bfqd->oom_bfqq.entity.prio_changed = 1;
 
 	wbt_disable_default(q);
 	return 0;
