@@ -14,6 +14,7 @@
 #include <linux/semaphore.h>
 #include <linux/uuid.h>
 #include <linux/list_sort.h>
+#include <linux/namei.h>
 #include "misc.h"
 #include "ctree.h"
 #include "extent_map.h"
@@ -1884,18 +1885,22 @@ out:
 /*
  * Function to update ctime/mtime for a given device path.
  * Mainly used for ctime/mtime based probe like libblkid.
+ *
+ * We don't care about errors here, this is just to be kind to userspace.
  */
-static void update_dev_time(struct block_device *bdev)
+static void update_dev_time(const char *device_path)
 {
-	struct inode *inode = bdev->bd_inode;
+	struct path path;
 	struct timespec64 now;
+	int ret;
 
-	/* Shouldn't happen but just in case. */
-	if (!inode)
+	ret = kern_path(device_path, LOOKUP_FOLLOW, &path);
+	if (ret)
 		return;
 
-	now = current_time(inode);
-	generic_update_time(inode, &now, S_MTIME | S_CTIME);
+	now = current_time(d_inode(path.dentry));
+	inode_update_time(d_inode(path.dentry), &now, S_MTIME | S_CTIME);
+	path_put(&path);
 }
 
 static int btrfs_rm_dev_item(struct btrfs_device *device)
@@ -2071,7 +2076,7 @@ void btrfs_scratch_superblocks(struct btrfs_fs_info *fs_info,
 	btrfs_kobject_uevent(bdev, KOBJ_CHANGE);
 
 	/* Update ctime/mtime for device path for libblkid */
-	update_dev_time(bdev);
+	update_dev_time(device_path);
 }
 
 int btrfs_rm_device(struct btrfs_fs_info *fs_info, const char *device_path,
@@ -2735,7 +2740,7 @@ int btrfs_init_new_device(struct btrfs_fs_info *fs_info, const char *device_path
 	btrfs_forget_devices(device_path);
 
 	/* Update ctime/mtime for blkid or udev */
-	update_dev_time(bdev);
+	update_dev_time(device_path);
 
 	return ret;
 
@@ -7484,6 +7489,19 @@ int btrfs_read_chunk_tree(struct btrfs_fs_info *fs_info)
 	fs_info->fs_devices->total_rw_bytes = 0;
 
 	/*
+	 * Lockdep complains about possible circular locking dependency between
+	 * a disk's open_mutex (struct gendisk.open_mutex), the rw semaphores
+	 * used for freeze procection of a fs (struct super_block.s_writers),
+	 * which we take when starting a transaction, and extent buffers of the
+	 * chunk tree if we call read_one_dev() while holding a lock on an
+	 * extent buffer of the chunk tree. Since we are mounting the filesystem
+	 * and at this point there can't be any concurrent task modifying the
+	 * chunk tree, to keep it simple, just skip locking on the chunk tree.
+	 */
+	ASSERT(!test_bit(BTRFS_FS_OPEN, &fs_info->flags));
+	path->skip_locking = 1;
+
+	/*
 	 * Read all device items, and then all the chunk items. All
 	 * device items are found before any chunk item (their object id
 	 * is smaller than the lowest possible object id for a chunk
@@ -7508,10 +7526,6 @@ int btrfs_read_chunk_tree(struct btrfs_fs_info *fs_info)
 				goto error;
 			break;
 		}
-		/*
-		 * The nodes on level 1 are not locked but we don't need to do
-		 * that during mount time as nothing else can access the tree
-		 */
 		node = path->nodes[1];
 		if (node) {
 			if (last_ra_node != node->start) {
@@ -7539,7 +7553,6 @@ int btrfs_read_chunk_tree(struct btrfs_fs_info *fs_info)
 			 * requirement for chunk allocation, see the comment on
 			 * top of btrfs_chunk_alloc() for details.
 			 */
-			ASSERT(!test_bit(BTRFS_FS_OPEN, &fs_info->flags));
 			chunk = btrfs_item_ptr(leaf, slot, struct btrfs_chunk);
 			ret = read_one_chunk(&found_key, leaf, chunk);
 			if (ret)
