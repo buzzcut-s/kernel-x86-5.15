@@ -678,7 +678,6 @@ void bfq_bfqq_move(struct bfq_data *bfqd, struct bfq_queue *bfqq,
 	else if (entity->on_st_or_in_serv)
 		bfq_put_idle_entity(bfq_entity_service_tree(entity), entity);
 	hlist_del(&bfqq->children_node);
-	bfqg_and_blkg_put(old_parent);
 
 	if (entity->parent &&
 	    entity->parent->last_bfqq_created == bfqq)
@@ -692,11 +691,16 @@ void bfq_bfqq_move(struct bfq_data *bfqd, struct bfq_queue *bfqq,
 	bfqg_and_blkg_get(bfqg);
 	hlist_add_head(&bfqq->children_node, &bfqg->children);
 
-	if (bfq_bfqq_busy(bfqq)) {
-		if (unlikely(!bfqd->nonrot_with_queueing))
-			bfq_pos_tree_add_move(bfqd, bfqq);
+	/*
+	 * Don't leave the pos_root to old bfqg, since the ref to old bfqg will
+	 * be released and the bfqg might be freed.
+	 */
+	if (unlikely(!bfqd->nonrot_with_queueing))
+		bfq_pos_tree_add_move(bfqd, bfqq);
+	bfqg_and_blkg_put(old_parent);
+
+	if (bfq_bfqq_busy(bfqq))
 		bfq_activate_bfqq(bfqd, bfqq);
-	}
 
 	if (!bfqd->in_service_queue && !bfqd->rq_in_driver)
 		bfq_schedule_dispatch(bfqd);
